@@ -150,14 +150,27 @@ class Spinner:
         return f"{time.time() - self.t0:.1f}s"
 
 
-def select(title, labels, descs=None):
+def legend(keys):
+    """Horizontal shortcut bar: [(key, action), ...], trailing items dropped if the terminal is narrow."""
+    out, width = [], 0
+    for k, action in keys:
+        width += len(k) + len(action) + 5
+        if width > cols() - 2:
+            break
+        out.append(c("38;5;16;48;5;45;1", f" {k} ") + " " + c(DIM, action))
+    return "  ".join(out)
+
+
+def select(title, labels, descs=None, back="back"):
     """Arrow-key / j-k selector. Returns chosen index; q, Esc or Ctrl-C raise KeyboardInterrupt."""
     import termios
     import tty
     n, i, top = len(labels), 0, 0
     h = min(n, 12)  # visible rows; list scrolls past this
     lw = max(len(x) for x in labels) + 2
-    print(c(BOLD, title) + c(DIM, "   ↑↓ move · enter select · q back"))
+    keys = [("↑↓", "move"), ("enter", "select")] + ([("1-9", "pick")] if n > 1 else []) \
+        + ([("g/G", "top/bottom")] if n > h else []) + [("q", back)]
+    print(c(BOLD, title))
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     sys.stdout.write("\033[?25l")
@@ -166,26 +179,34 @@ def select(title, labels, descs=None):
         while True:
             top = min(top, i) if i < top else max(top, i - h + 1)
             for j in range(top, top + h):
-                label = clip(labels[j], cols() - 6)
-                desc = clip(descs[j], max(cols() - lw - 6, 0)) if descs else ""
+                label = clip(labels[j], cols() - 8)
+                desc = clip(descs[j], max(cols() - lw - 8, 0)) if descs else ""
+                num = str(j + 1) if j < 9 else " "
                 if j == i:
-                    line = c(ACCENT + ";1", f" ❯ {label:<{lw}}") + desc
+                    line = c(ACCENT + ";1", f" ❯ {num} {label:<{lw}}") + desc
                 else:
-                    line = f"   {label:<{lw}}" + c(DIM, desc)
+                    line = "   " + c(DIM, num) + f" {label:<{lw}}" + c(DIM, desc)
                 sys.stdout.write("\033[2K" + line + "\n")
-            more = f"   {i + 1}/{n}" if n > h else ""
-            sys.stdout.write("\033[2K" + c(DIM, more) + "\n")
+            more = c(DIM, f"   {i + 1}/{n}") if n > h else ""
+            sys.stdout.write("\033[2K" + more + "\n\033[2K" + legend(keys) + "\n")
             sys.stdout.flush()
             k = os.read(fd, 3)
             if k in (b"\x1b[A", b"k"):
                 i = (i - 1) % n
             elif k in (b"\x1b[B", b"j"):
                 i = (i + 1) % n
+            elif k == b"g":
+                i = 0
+            elif k == b"G":
+                i = n - 1
+            elif k.isdigit() and 1 <= int(k) <= min(n, 9):
+                i = int(k) - 1
+                return i
             elif k in (b"\r", b"\n"):
                 return i
             elif k in (b"q", b"\x1b", b"\x03"):
                 raise KeyboardInterrupt
-            sys.stdout.write(f"\033[{h + 1}A")
+            sys.stdout.write(f"\033[{h + 2}A")
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         sys.stdout.write("\033[?25h")
@@ -816,7 +837,7 @@ def menu():
     while True:
         header()
         try:
-            label, _, fn = items[select("What do you want to do?", [x[0] for x in items], [x[1] for x in items])]
+            label, _, fn = items[select("What do you want to do?", [x[0] for x in items], [x[1] for x in items], back="quit")]
         except KeyboardInterrupt:
             return
         if fn is None:
