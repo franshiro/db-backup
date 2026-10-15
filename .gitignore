@@ -1,0 +1,8 @@
+__pycache__/
+*.egg-info/
+build/
+# never commit database lists (contain passwords) or backups
+databases.json
+dbb-databases.json
+*.sql.gz
+.env*

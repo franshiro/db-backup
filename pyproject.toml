@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbb"
+version = "1.4.0"
+description = "Backup & restore PostgreSQL / MySQL using local tools or Docker"
+requires-python = ">=3.8"
+
+[project.scripts]
+dbb = "dbb:main"
+
+[tool.setuptools]
+py-modules = ["dbb"]
