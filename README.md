@@ -22,7 +22,8 @@ dbb                       # interactive menu
 dbb add                   # add a connection (tests it and detects the server version)
 dbb add --env [FILE|DIR]  # add connections found in a .env file; lines starting with # are ignored
 dbb list | check | remove
-dbb backup [NAME...] [--all]
+dbb backup [NAME...] [--all | --bulk]
+dbb mark [NAME...] [--off]  # choose databases for `backup --bulk` (no names = checklist)
 dbb restore [FILE] [--to NAME] [--dry-run]
 dbb export FILE | import FILE [--replace]
 dbb update | uninstall

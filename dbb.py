@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
@@ -39,7 +39,7 @@ TOOLS = {
     "postgres": {"backup": ["pg_dump"], "restore": ["psql"]},
     "mysql": {"backup": ["mysqldump"], "restore": ["mysql"]},
 }
-FIELDS = ["name", "type", "host", "port", "user", "password", "database", "version", "docker_image"]
+FIELDS = ["name", "type", "host", "port", "user", "password", "database", "bulk", "version", "docker_image"]
 
 # ---------- output ----------
 
@@ -161,15 +161,19 @@ def legend(keys):
     return "  ".join(out)
 
 
-def select(title, labels, descs=None, back="back"):
-    """Arrow-key / j-k selector. Returns chosen index; q, Esc or Ctrl-C raise KeyboardInterrupt."""
+def select(title, labels, descs=None, back="back", checked=None):
+    """Arrow-key / j-k selector. Returns chosen index; q, Esc or Ctrl-C raise KeyboardInterrupt.
+    With checked (list of bools): checklist mode, space toggles in place, Enter returns the list."""
     import termios
     import tty
     n, i, top = len(labels), 0, 0
     h = min(n, 12)  # visible rows; list scrolls past this
     lw = max(len(x) for x in labels) + 2
-    keys = [("↑↓", "move"), ("enter", "select")] + ([("1-9", "pick")] if n > 1 else []) \
-        + ([("g/G", "top/bottom")] if n > h else []) + [("q", back)]
+    if checked is None:
+        keys = [("↑↓", "move"), ("enter", "select")] + ([("1-9", "pick")] if n > 1 else [])
+    else:
+        keys = [("↑↓", "move"), ("space", "toggle"), ("a", "all/none"), ("enter", "save")]
+    keys += ([("g/G", "top/bottom")] if n > h else []) + [("q", back)]
     print(c(BOLD, title))
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -182,6 +186,8 @@ def select(title, labels, descs=None, back="back"):
                 label = clip(labels[j], cols() - 8)
                 desc = clip(descs[j], max(cols() - lw - 8, 0)) if descs else ""
                 num = str(j + 1) if j < 9 else " "
+                if checked is not None:
+                    num = c(GREEN, "◉") if checked[j] else c(DIM, "○")
                 if j == i:
                     line = c(ACCENT + ";1", f" ❯ {num} {label:<{lw}}") + desc
                 else:
@@ -199,11 +205,15 @@ def select(title, labels, descs=None, back="back"):
                 i = 0
             elif k == b"G":
                 i = n - 1
-            elif k.isdigit() and 1 <= int(k) <= min(n, 9):
+            elif checked is not None and k == b" ":
+                checked[i] = not checked[i]
+            elif checked is not None and k == b"a":
+                checked[:] = [not all(checked)] * n
+            elif checked is None and k.isdigit() and 1 <= int(k) <= min(n, 9):
                 i = int(k) - 1
                 return i
             elif k in (b"\r", b"\n"):
-                return i
+                return i if checked is None else checked
             elif k in (b"q", b"\x1b", b"\x03"):
                 raise KeyboardInterrupt
             sys.stdout.write(f"\033[{h + 2}A")
@@ -483,11 +493,14 @@ def cmd_list(a):
         return
     w = max([18] + [len(db["name"]) for db in dbs])
     print(c(DIM, f"   {'NAME':<{w}} {'SERVER':<20} {'DATABASE':<16} CONNECTION"))
+    mark = lambda db: c(GREEN, "◉") if db.get("bulk") else c(DIM, "○")
     for db in dbs:
         t, tc = db["type"], TYPE_COLOR[db["type"]]
         conn = f"{db['user']}@{db['host']}:{db['port']}"
-        print(f" {c(tc, '●')} {c(BOLD, db['name'].ljust(w))} {c(tc, pretty(t, db.get('version')).ljust(20))} "
+        print(f" {mark(db)} {c(BOLD, db['name'].ljust(w))} {c(tc, pretty(t, db.get('version')).ljust(20))} "
               f"{db['database']:<16} {c(DIM, conn)}")
+    print(c(DIM, f"\n {c(GREEN, '◉')} included in bulk backup ({sum(1 for x in dbs if x.get('bulk'))}/{len(dbs)})"
+                 "  · change with `dbb mark`"))
 
 
 def save_new(db):
@@ -707,20 +720,71 @@ def cmd_import(a):
     ok(f"imported {len(incoming)} databases ({'replaced list' if a.replace else 'merged'})")
 
 
+def cmd_mark(a):
+    dbs = load()
+    if not dbs:
+        die("no databases yet — add one with `dbb add`")
+    if a.names:
+        missing = set(a.names) - {x["name"] for x in dbs}
+        if missing:
+            die(f"not found: {', '.join(sorted(missing))}")
+        for db in dbs:
+            if db["name"] in a.names:
+                db["bulk"] = not a.off
+    elif interactive():
+        marks = select("Include in bulk backup", [describe(x) for x in dbs], back="cancel",
+                       checked=[bool(x.get("bulk")) for x in dbs])
+        for db, m in zip(dbs, marks):
+            db["bulk"] = m
+    else:
+        die("give database names, e.g. `dbb mark prod-pg app-my` (or --off)")
+    save(dbs)
+    on = [x["name"] for x in dbs if x.get("bulk")]
+    ok(f"bulk backup: {len(on)}/{len(dbs)} databases" + (f" — {', '.join(on)}" if on else ""))
+
+
 def cmd_backup(a):
-    names = [x["name"] for x in load()] if a.all else a.names
+    if a.all:
+        names = [x["name"] for x in load()]
+    elif a.bulk:
+        names = [x["name"] for x in load() if x.get("bulk")]
+        if not names and interactive():
+            print(c(YELLOW, "! ") + "no databases marked for bulk backup yet — choose them now")
+            cmd_mark(argparse.Namespace(names=[], off=False))
+            names = [x["name"] for x in load() if x.get("bulk")]
+        if not names:
+            die("no databases marked for bulk backup — run `dbb mark`")
+    else:
+        names = a.names
     if not names:
         names = [pick(load(), "Backup which database?", describe)["name"]]
     if a.output and len(names) > 1:
         die("-o only works with a single database")
-    for n in names:
-        db = get_db(n)
+    if len(names) == 1:
+        db = get_db(names[0])
         out, el = backup(db, a.output, a.docker)
-        if len(names) == 1:
-            box("✓ Backup complete", [("database", f"{db['name']} ({db['type']})"),
-                                      ("file", str(out)), ("size", human(out.stat().st_size)), ("time", el)])
-        else:
-            ok(f"{c(BOLD, n.ljust(18))} {human(out.stat().st_size):>9}  {c(DIM, el)}  {c(DIM, out.name)}")
+        box("✓ Backup complete", [("database", f"{db['name']} ({db['type']})"),
+                                  ("file", str(out)), ("size", human(out.stat().st_size)), ("time", el)])
+        return
+
+    # several databases: one failure must not stop the rest
+    done, failed, t0 = [], [], time.time()
+    for n in names:
+        try:
+            out, el = backup(get_db(n), None, a.docker)
+        except SystemExit as e:
+            print(c(RED, "✗ ") + c(BOLD, n.ljust(18)) + " " + str(e.code).split("✗ ")[-1])
+            failed.append(n)
+            continue
+        done.append(out)
+        ok(f"{c(BOLD, n.ljust(18))} {human(out.stat().st_size):>9}  {c(DIM, el)}  {c(DIM, out.name)}")
+    print()
+    rows = [("ok", f"{len(done)}/{len(names)}"), ("size", human(sum(p.stat().st_size for p in done))),
+            ("time", f"{time.time() - t0:.1f}s")] + ([("failed", ", ".join(failed))] if failed else [])
+    box("✓ Bulk backup complete" if not failed else "! Bulk backup finished with errors", rows,
+        color=GREEN if not failed else RED)
+    if failed:
+        sys.exit(1)
 
 
 def cmd_restore(a):
@@ -809,7 +873,8 @@ def header():
     have = lambda t: all(shutil.which(x) for x in TOOLS[t]["backup"] + TOOLS[t]["restore"])
     docker = bool(shutil.which("docker")) and subprocess.run(["docker", "info"], capture_output=True).returncode == 0
     mark = lambda yes: c(GREEN, "✓") if yes else c(RED, "✗")
-    print(f"  {c(ACCENT, '●')} {c(BOLD, str(len(dbs)))} databases   "
+    bulk = sum(1 for x in dbs if x.get("bulk"))
+    print(f"  {c(ACCENT, '●')} {c(BOLD, str(len(dbs)))} databases {c(DIM, f'({bulk} bulk)')}   "
           f"{c(ACCENT, '●')} {c(BOLD, str(len(files)))} backups {c(DIM, human(sum(p.stat().st_size for p in files)))}   "
           f"{c(DIM, 'pg')} {mark(have('postgres'))}  {c(DIM, 'mysql')} {mark(have('mysql'))}  "
           f"{c(DIM, 'docker')} {mark(docker)}")
@@ -820,8 +885,10 @@ def header():
 def menu():
     ns = argparse.Namespace
     items = [
-        ("↑  Backup", "dump one database", lambda: cmd_backup(ns(names=[], all=False, output=None, docker=False))),
-        ("⇈  Backup all", "dump every saved database", lambda: cmd_backup(ns(names=[], all=True, output=None, docker=False))),
+        ("↑  Backup", "dump one database", lambda: cmd_backup(ns(names=[], all=False, bulk=False, output=None, docker=False))),
+        ("⇈  Bulk backup", "dump every database marked ◉", lambda: cmd_backup(
+            ns(names=[], all=False, bulk=True, output=None, docker=False))),
+        ("◉  Bulk set", "choose which databases bulk backup includes", lambda: cmd_mark(ns(names=[], off=False))),
         ("↓  Restore", "drop target & load a backup", lambda: cmd_restore(
             ns(file=None, to=None, yes=False, dry_run=False, no_safety_backup=False, docker=False))),
         ("≡  Databases", "show saved connections", lambda: cmd_list(None)),
@@ -869,6 +936,10 @@ def main():
     s.add_argument("--env", nargs="?", const=".env", metavar="FILE",
                    help="read connection from a .env file or project folder (default ./.env); # lines are ignored")
     s.set_defaults(fn=cmd_add)
+    s = sub.add_parser("mark", help="choose databases included in `backup --bulk`")
+    s.add_argument("names", nargs="*", help="database names (empty = interactive checklist)")
+    s.add_argument("--off", action="store_true", help="unmark the given databases")
+    s.set_defaults(fn=cmd_mark)
     s = sub.add_parser("check", help="test connection & detect server version")
     s.add_argument("names", nargs="*", help="saved database names (empty = all)")
     s.add_argument("--docker", action="store_true", help="force docker even if local tools exist")
@@ -886,6 +957,7 @@ def main():
     s = sub.add_parser("backup", help="backup database(s)")
     s.add_argument("names", nargs="*", help="saved database names (empty = choose)")
     s.add_argument("--all", action="store_true", help="backup every saved database")
+    s.add_argument("--bulk", action="store_true", help="backup databases marked for bulk backup (see: dbb mark)")
     s.add_argument("-o", "--output", help="output file (default: ~/.dbb/backups/<name>_<time>.<ext>)")
     s.add_argument("--docker", action="store_true", help="force docker even if local tools exist")
     s.set_defaults(fn=cmd_backup)
