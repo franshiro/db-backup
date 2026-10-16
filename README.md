@@ -26,13 +26,16 @@ dbb backup [NAME...] [--all | --bulk]
 dbb mark [NAME...] [--off]  # choose databases for `backup --bulk` (no names = checklist)
 dbb restore [FILE] [--to NAME] [--dry-run]
 dbb export FILE | import FILE [--replace]
+dbb backups [NAME] [--list | --open | --prune N]   # browse, view, restore, delete backup files
+dbb config backup-dir PATH|default [--move]       # where backups are saved
 dbb update | uninstall
 ```
 
 Restore is a **full restore**: the target database is dropped, recreated and loaded from
 the backup. A safety backup of the target is taken first (`--no-safety-backup` to skip).
 
-Data lives in `~/.dbb/` (`databases.json`, `backups/`). The database list contains
+Data lives in `~/.dbb/` (`databases.json`, `settings.json`, `backups/`). Change the backup
+location with `dbb config backup-dir` or the Settings menu (`DBB_BACKUP_DIR` env overrides it). The database list contains
 passwords in plain text and is created with mode 600 — do not commit exported lists.
 
 ## Test

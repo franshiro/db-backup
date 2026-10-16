@@ -22,14 +22,26 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
 
 HOME = Path(os.environ.get("DBB_HOME", Path.home() / ".dbb"))
 CONFIG = Path(os.environ.get("DBB_CONFIG", HOME / "databases.json"))
-BACKUP_DIR = Path(os.environ.get("DBB_BACKUP_DIR", HOME / "backups"))
+SETTINGS = HOME / "settings.json"
+DEFAULT_BACKUP_DIR = HOME / "backups"
+
+
+def load_settings():
+    try:
+        return json.loads(SETTINGS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+# precedence: DBB_BACKUP_DIR env > settings.json (`dbb config backup-dir`) > ~/.dbb/backups
+BACKUP_DIR = Path(os.environ.get("DBB_BACKUP_DIR") or load_settings().get("backup_dir") or DEFAULT_BACKUP_DIR)
 
 DEFAULTS = {
     "postgres": {"port": 5432, "user": "postgres", "image": "postgres:17", "ext": ".pg.sql.gz"},
@@ -167,7 +179,7 @@ def select(title, labels, descs=None, back="back", checked=None):
     import termios
     import tty
     n, i, top = len(labels), 0, 0
-    h = min(n, 12)  # visible rows; list scrolls past this
+    h = min(n, 15)  # visible rows; list scrolls past this
     lw = max(len(x) for x in labels) + 2
     if checked is None:
         keys = [("↑↓", "move"), ("enter", "select")] + ([("1-9", "pick")] if n > 1 else [])
@@ -823,6 +835,231 @@ def cmd_restore(a):
                                ("time", el)])
 
 
+# ---------- backups browser ----------
+
+BACKUP_RE = re.compile(r"^(?P<db>.+?)(?P<pre>_prerestore)?_(?P<ts>\d{8}_\d{6})(?:_\d+)?\.(?:pg|my)\.sql\.gz$")
+
+
+def tilde(p):
+    home = str(Path.home())
+    return "~" + str(p)[len(home):] if str(p).startswith(home) else str(p)
+
+
+def backup_rows(name=None):
+    """Backup files (newest first) with the database they belong to."""
+    rows = []
+    for p in backups():
+        m = BACKUP_RE.match(p.name)
+        st = p.stat()
+        r = {"path": p, "db": m["db"] if m else "?", "pre": bool(m and m["pre"]), "size": st.st_size, "mtime": st.st_mtime}
+        if not name or r["db"] == name:
+            rows.append(r)
+    return rows
+
+
+def file_label(r):
+    tag = "  (prerestore)" if r["pre"] else ""  # plain text: labels are measured/clipped by the selector
+    return f"{r['path'].name:<52} {human(r['size']):>9}  {ago(r['mtime']):>9}{tag}"
+
+
+def open_path(p):
+    opener = "open" if platform.system() == "Darwin" else "xdg-open"
+    if not shutil.which(opener):
+        die(f"cannot open folders here; path: {p}")
+    subprocess.run([opener, str(p)])
+
+
+def show_contents(path):
+    """Page the SQL inside a backup (less), or print the first lines when no pager."""
+    pager = os.environ.get("PAGER", "less")
+    if interactive() and shutil.which(pager.split()[0]):
+        p = subprocess.Popen(pager.split() + (["-S"] if pager == "less" else []), stdin=subprocess.PIPE)
+        try:
+            with gzip.open(path, "rb") as f:
+                shutil.copyfileobj(f, p.stdin)
+        except BrokenPipeError:  # user quit the pager early
+            pass
+        finally:
+            try:
+                p.stdin.close()
+            except BrokenPipeError:
+                pass
+            p.wait()
+    else:
+        with gzip.open(path, "rt", errors="replace") as f:
+            for _, line in zip(range(60), f):
+                print(line, end="")
+
+
+def prune(keep, name=None, yes=False):
+    """Delete all but the newest `keep` backups per database (prerestore files counted separately)."""
+    groups = {}
+    for r in backup_rows(name):
+        groups.setdefault((r["db"], r["pre"]), []).append(r)
+    victims = [r for g in groups.values() for r in g[keep:]]
+    if not victims:
+        ok(f"nothing to delete (every database has ≤ {keep} backups)")
+        return
+    for r in victims:
+        print(c(RED, "  − ") + file_label(r))
+    total = human(sum(r["size"] for r in victims))
+    if not yes and ask(f"delete {len(victims)} files ({total})? [y/N]").lower() != "y":
+        die("aborted")
+    for r in victims:
+        r["path"].unlink()
+    ok(f"deleted {len(victims)} old backups, freed {total}")
+
+
+def print_backups(name=None):
+    rows = backup_rows(name)
+    print(c(DIM, f"location: {tilde(BACKUP_DIR)}"))
+    if not rows:
+        print(c(DIM, "no backups yet — run `dbb backup`"))
+        return
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["db"], []).append(r)
+    for db, rs in sorted(groups.items()):
+        print()
+        print(f"{c(ACCENT, '●')} {c(BOLD, db)}  " + c(DIM, f"{len(rs)} files · {human(sum(r['size'] for r in rs))}"
+                                                           f" · latest {ago(rs[0]['mtime'])}"))
+        for r in rs:
+            print("   " + file_label(r))
+    print(c(DIM, f"\n{len(rows)} files · {human(sum(r['size'] for r in rows))}"))
+
+
+def browse_backups(name=None):
+    """Interactive: pick a backup, then restore / view / reveal / delete it."""
+    ns = argparse.Namespace
+    while True:
+        rows = backup_rows(name)
+        extra = ["⌂  Open backup folder", "✂  Prune old backups (keep newest N per database)"]
+        labels = extra + [file_label(r) for r in rows]
+        print(c(DIM, f"{len(rows)} files · {human(sum(r['size'] for r in rows))} in {tilde(BACKUP_DIR)}"))
+        try:
+            i = select("Backups (newest first)", labels)
+        except KeyboardInterrupt:
+            return
+        print()
+        if i == 0:
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            open_path(BACKUP_DIR)
+            continue
+        if i == 1:
+            keep = ask("keep how many per database?", "5")
+            if not keep.isdigit() or int(keep) < 1:
+                die("enter a number ≥ 1")
+            prune(int(keep), name)
+            continue
+        r = rows[i - len(extra)]
+        actions = [("↓  Restore", "drop a target database and load this file"),
+                   ("≡  View contents", "page through the SQL (q to exit)"),
+                   ("⌂  Show in folder", tilde(r["path"].parent)),
+                   ("−  Delete", human(r["size"]))]
+        try:
+            j = select(r["path"].name, [x[0] for x in actions], [x[1] for x in actions])
+        except KeyboardInterrupt:
+            continue
+        print()
+        if j == 0:
+            return cmd_restore(ns(file=str(r["path"]), to=None, yes=False, dry_run=False,
+                                  no_safety_backup=False, docker=False))
+        if j == 1:
+            show_contents(r["path"])
+        elif j == 2:
+            subprocess.run(["open", "-R", str(r["path"])]) if platform.system() == "Darwin" else open_path(r["path"].parent)
+        elif ask(f"delete {r['path'].name}? [y/N]").lower() == "y":
+            r["path"].unlink()
+            ok(f"deleted {r['path'].name}")
+
+
+def cmd_backups(a):
+    if a.open:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        return open_path(BACKUP_DIR)
+    if a.prune is not None:
+        return prune(a.prune, a.name, a.yes)
+    if interactive() and not a.list:
+        return browse_backups(a.name)
+    print_backups(a.name)
+
+
+# ---------- settings ----------
+
+def set_backup_dir(value, move=None):
+    """Save a new backup location (None/"default" resets). move: True/False, or None to ask."""
+    global BACKUP_DIR
+    new = (DEFAULT_BACKUP_DIR if value in (None, "", "default") else Path(value).expanduser()).resolve()
+    try:
+        new.mkdir(parents=True, exist_ok=True)
+        probe_file = new / ".dbb-write-test"
+        probe_file.write_text("ok")
+        probe_file.unlink()
+    except OSError as e:
+        die(f"cannot use {new}: {e}")
+
+    old, files = BACKUP_DIR, backups()
+    if files and new.resolve() != old.resolve():
+        if move is None:
+            move = interactive() and ask(f"move {len(files)} existing backups "
+                                         f"({human(sum(p.stat().st_size for p in files))}) to {tilde(new)}? [y/N]").lower() == "y"
+        if move:
+            with Spinner(f"moving backups to {tilde(new)}"):
+                for f in files:
+                    shutil.move(str(f), str(new / f.name))
+            ok(f"moved {len(files)} backups")
+        else:
+            info(f"existing backups stay in {tilde(old)}")
+
+    settings = load_settings()
+    if new == DEFAULT_BACKUP_DIR.resolve():
+        settings.pop("backup_dir", None)
+    else:
+        settings["backup_dir"] = str(new)
+    HOME.mkdir(parents=True, exist_ok=True)
+    SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+    BACKUP_DIR = new
+    ok(f"backups will be saved to {c(BOLD, tilde(new))}")
+    if os.environ.get("DBB_BACKUP_DIR"):
+        print(c(YELLOW, "! ") + f"DBB_BACKUP_DIR is set ({os.environ['DBB_BACKUP_DIR']}) and overrides this setting")
+
+
+def show_settings():
+    src = "env DBB_BACKUP_DIR" if os.environ.get("DBB_BACKUP_DIR") else \
+        ("settings" if load_settings().get("backup_dir") else "default")
+    box("Settings", [("backups", f"{tilde(BACKUP_DIR)}  ({src})"), ("databases", tilde(CONFIG)),
+                     ("settings", tilde(SETTINGS))], color=ACCENT)
+
+
+def cmd_config(a):
+    if a.key is None:
+        return show_settings()
+    if a.key != "backup-dir":
+        die(f"unknown setting {a.key!r} (available: backup-dir)")
+    if a.value is None:
+        print(BACKUP_DIR)
+        return
+    set_backup_dir(a.value, True if a.move else (False if a.no_move else None))
+
+
+def settings_menu():
+    while True:
+        show_settings()
+        items = [("⇢  Change backup location", tilde(BACKUP_DIR)), ("↺  Reset to default", tilde(DEFAULT_BACKUP_DIR))]
+        try:
+            i = select("Settings", [x[0] for x in items], [x[1] for x in items])
+        except KeyboardInterrupt:
+            return
+        print()
+        if i == 0:
+            path = ask("new backup folder (e.g. /Volumes/Drive/db-backups)")
+            if path:
+                set_backup_dir(path)
+        else:
+            set_backup_dir("default")
+        print()
+
+
 def installed_file():
     """Path of this executable when installed by install.sh (file named 'dbb'), else None (pip/source)."""
     f = Path(__file__).resolve()
@@ -891,6 +1128,7 @@ def menu():
         ("◉  Bulk set", "choose which databases bulk backup includes", lambda: cmd_mark(ns(names=[], off=False))),
         ("↓  Restore", "drop target & load a backup", lambda: cmd_restore(
             ns(file=None, to=None, yes=False, dry_run=False, no_safety_backup=False, docker=False))),
+        ("▤  Backups", "browse, view, restore or delete backup files", lambda: browse_backups()),
         ("≡  Databases", "show saved connections", lambda: cmd_list(None)),
         ("✓  Check", "test connections & detect server versions", lambda: cmd_check(ns(names=[], docker=False))),
         ("+  Add", "save a new connection", lambda: cmd_add(ns(env=None))),
@@ -899,6 +1137,7 @@ def menu():
         ("⇥  Export", "write database list to JSON", lambda: cmd_export(
             ns(file=ask("export to", "dbb-databases.json")))),
         ("⇤  Import", "merge database list from JSON", lambda: cmd_import(ns(file=ask("import from"), replace=False))),
+        ("⚙  Settings", "backup location", settings_menu),
         ("×  Quit", "", None),
     ]
     while True:
@@ -936,6 +1175,22 @@ def main():
     s.add_argument("--env", nargs="?", const=".env", metavar="FILE",
                    help="read connection from a .env file or project folder (default ./.env); # lines are ignored")
     s.set_defaults(fn=cmd_add)
+    s = sub.add_parser("backups", help="list / browse backup files")
+    s.add_argument("name", nargs="?", help="only backups of this database")
+    s.add_argument("--list", action="store_true", help="print list instead of the interactive browser")
+    s.add_argument("--open", action="store_true", help="open the backup folder")
+    s.add_argument("--prune", type=int, metavar="N", help="delete all but the newest N backups per database")
+    s.add_argument("-y", "--yes", action="store_true", help="skip confirmation (with --prune)")
+    s.set_defaults(fn=cmd_backups)
+
+    s = sub.add_parser("config", help="show or change settings, e.g. `dbb config backup-dir /Volumes/Drive/bk`")
+    s.add_argument("key", nargs="?", help="backup-dir")
+    s.add_argument("value", nargs="?", help="new value (`default` resets)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--move", action="store_true", help="move existing backups to the new location")
+    g.add_argument("--no-move", action="store_true", help="leave existing backups where they are")
+    s.set_defaults(fn=cmd_config)
+
     s = sub.add_parser("mark", help="choose databases included in `backup --bulk`")
     s.add_argument("names", nargs="*", help="database names (empty = interactive checklist)")
     s.add_argument("--off", action="store_true", help="unmark the given databases")
