@@ -841,19 +841,26 @@ def cmd_restore(a):
     if db["type"] != kind:
         die(f"{path.name} is a {kind} backup but {db['name']} is {db['type']}")
 
+    with Spinner(f"connecting to {c(BOLD, db['name'])}"):
+        _, exists, err = probe(db, a.docker)
+    if err:
+        die(f"cannot connect to {db['name']}: {err}")
+    skip_safety = a.no_safety_backup or not exists  # nothing to back up when the database is new
+
     print()
     box("! DANGER · full restore", [
         ("target", f"{db['name']} → {db['database']} @ {db['host']}:{db['port']}"),
-        ("action", "DROP database, recreate, load backup"),
+        ("action", "DROP database, recreate, load backup" if exists else "CREATE new database, load backup"),
         ("source", path.name),
-        ("safety", "skipped" if a.no_safety_backup else "backup current target first"),
-    ], color=RED)
+        ("safety", "skipped" if a.no_safety_backup else "backup current target first" if exists
+                   else "skipped (database does not exist yet)"),
+    ], color=RED if exists else YELLOW)
     if a.dry_run:
         info("dry-run: nothing changed")
         return
     if not a.yes and ask(f"type {c(RED, db['database'])} to continue") != db["database"]:
         die("aborted")
-    if not a.no_safety_backup:
+    if not skip_safety:
         out, el = backup(db, new_backup_path(db, "_prerestore"), a.docker)
         ok(f"safety backup {c(DIM, out.name)} ({human(out.stat().st_size)}, {el})")
     el = restore(db, path, a.docker)
