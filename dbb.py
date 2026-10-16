@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
@@ -394,6 +394,25 @@ def copy(src, dst, sp):
         sp.n += len(b)
 
 
+class NoGtid:
+    """Read wrapper that drops SET @@GLOBAL.GTID_PURGED (written by mysqldump on GTID servers).
+    It fails on any target that already has its own GTID history (ERROR 3546)."""
+    def __init__(self, f):
+        self.f, self.skip = f, False
+
+    def read(self, n=-1):
+        while True:
+            line = self.f.readline()
+            if not line:
+                return b""
+            if line.startswith(b"SET @@GLOBAL.GTID_PURGED"):
+                self.skip = True
+            if not self.skip:
+                return line
+            if line.rstrip().endswith(b";"):  # the GTID set can span several lines
+                self.skip = False
+
+
 def stream(argv, env, sp, src=None, dst=None):
     """Pipe src (file obj) -> process -> dst (file obj), counting bytes on the spinner."""
     p = subprocess.Popen(argv, env=env,
@@ -420,6 +439,12 @@ def new_backup_path(db, tag=""):
     return out
 
 
+def has_gtid_flag(wrap, env):
+    """True when this mysqldump (MySQL, not MariaDB) supports --set-gtid-purged."""
+    p = subprocess.run(wrap(["mysqldump", "--help"]), env=env, capture_output=True)
+    return b"--set-gtid-purged" in p.stdout
+
+
 def backup(db, out, force_docker):
     """Dump db to a gzip file. Returns (path, elapsed)."""
     wrap, env, host, ver = runner(db, "backup", force_docker)
@@ -434,6 +459,7 @@ def backup(db, out, force_docker):
                     "--single-transaction", "--routines", "--triggers", "--events",
                     "--no-tablespaces"]
                    + (["--column-statistics=0"] if ver and ver.startswith("5.") else [])  # 8.x client vs 5.x server
+                   + (["--set-gtid-purged=OFF"] if has_gtid_flag(wrap, env) else [])  # MariaDB dump has no such flag
                    + [db["database"]])
     with Spinner(f"backing up {c(BOLD, db['name'])}") as sp, gzip.open(tmp, "wb") as f:
         rc = stream(cmd, env, sp, dst=f)
@@ -489,7 +515,7 @@ def restore(db, path, force_docker):
             run(wrap(["mysql", *conn, "-e",
                       f"DROP DATABASE IF EXISTS {ident}; CREATE DATABASE {ident};"]), env)
             with gzip.open(path, "rb") as f:
-                rc = stream(wrap(["mysql", *conn, name]), env, sp, src=f)
+                rc = stream(wrap(["mysql", *conn, name]), env, sp, src=NoGtid(f))
 
     if rc != 0:
         die(f"restore finished with errors (exit {rc}); check output above")

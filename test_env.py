@@ -1,8 +1,10 @@
-"""Self-check for .env parsing. Run: python3 test_env.py"""
+"""Self-check for .env parsing and dump filtering. Run: python3 test_env.py"""
 import tempfile
 from pathlib import Path
 
-from dbb import env_candidates, read_env
+import io
+
+from dbb import NoGtid, env_candidates, read_env
 
 ENV = """
 # Laravel style; commented lines are inactive
@@ -49,5 +51,14 @@ assert (rep["type"], rep["host"], rep["port"], rep["user"], rep["password"], rep
 pg = found["PG_*"]
 assert (pg["type"], pg["host"], pg["port"], pg["user"], pg["database"]) == \
     ("postgres", "pg.local", 5432, "mes", "analytics")
+
+dump = (b"SET @@SESSION.SQL_LOG_BIN= 0;\n"
+        b"SET @@GLOBAL.GTID_PURGED=/*!80000 '+'*/ 'a:1-5,\n"
+        b"b:1-9';\n"
+        b"CREATE TABLE t (x int);\n"
+        b"SET @@GLOBAL.GTID_PURGED='c:1';\n"
+        b"INSERT INTO t VALUES (1);\n")
+out = b"".join(iter(NoGtid(io.BytesIO(dump)).read, b""))
+assert out == b"SET @@SESSION.SQL_LOG_BIN= 0;\nCREATE TABLE t (x int);\nINSERT INTO t VALUES (1);\n", out
 
 print("ok")
