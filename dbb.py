@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
@@ -463,9 +463,14 @@ def copy(src, dst, sp):
         sp.n += len(b)
 
 
-class NoGtid:
-    """Read wrapper that drops SET @@GLOBAL.GTID_PURGED (written by mysqldump on GTID servers).
-    It fails on any target that already has its own GTID history (ERROR 3546)."""
+DEFINER_RE = re.compile(rb"DEFINER=`(?:[^`]|``)*`@`(?:[^`]|``)*`")
+
+
+class MysqlFilter:
+    """Read wrapper that makes a mysqldump file load on another server:
+    - drops SET @@GLOBAL.GTID_PURGED, which fails on a target with its own GTID history (ERROR 3546)
+    - drops DEFINER=`user`@`host` from views, routines, triggers and events, so they belong to the
+      restoring user instead of an account that may not exist there (ERROR 1449)"""
     def __init__(self, f):
         self.f, self.skip = f, False
 
@@ -477,7 +482,7 @@ class NoGtid:
             if line.startswith(b"SET @@GLOBAL.GTID_PURGED"):
                 self.skip = True
             if not self.skip:
-                return line
+                return line if line.startswith(b"INSERT INTO") else DEFINER_RE.sub(b"", line)  # never touch row data
             if line.rstrip().endswith(b";"):  # the GTID set can span several lines
                 self.skip = False
 
@@ -584,7 +589,7 @@ def restore(db, path, force_docker):
             run(wrap(["mysql", *conn, "-e",
                       f"DROP DATABASE IF EXISTS {ident}; CREATE DATABASE {ident};"]), env)
             with gzip.open(path, "rb") as f:
-                rc = stream(wrap(["mysql", *conn, name]), env, sp, src=NoGtid(f))
+                rc = stream(wrap(["mysql", *conn, name]), env, sp, src=MysqlFilter(f))
 
     if rc != 0:
         die(f"restore finished with errors (exit {rc}); check output above")

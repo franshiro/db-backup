@@ -4,7 +4,7 @@ from pathlib import Path
 
 import io
 
-from dbb import NoGtid, env_candidates, read_env, split_name
+from dbb import MysqlFilter, env_candidates, read_env, split_name
 
 ENV = """
 # Laravel style; commented lines are inactive
@@ -57,9 +57,14 @@ dump = (b"SET @@SESSION.SQL_LOG_BIN= 0;\n"
         b"b:1-9';\n"
         b"CREATE TABLE t (x int);\n"
         b"SET @@GLOBAL.GTID_PURGED='c:1';\n"
-        b"INSERT INTO t VALUES (1);\n")
-out = b"".join(iter(NoGtid(io.BytesIO(dump)).read, b""))
-assert out == b"SET @@SESSION.SQL_LOG_BIN= 0;\nCREATE TABLE t (x int);\nINSERT INTO t VALUES (1);\n", out
+        b"INSERT INTO t VALUES (1);\n"
+        b"/*!50013 DEFINER=`procure-prod`@`%` SQL SECURITY DEFINER */\n"
+        b"CREATE DEFINER=`a``b`@`localhost` PROCEDURE `p`()\n"
+        b"INSERT INTO t VALUES ('DEFINER=`x`@`y`');\n")
+out = b"".join(iter(MysqlFilter(io.BytesIO(dump)).read, b""))
+assert out == (b"SET @@SESSION.SQL_LOG_BIN= 0;\nCREATE TABLE t (x int);\nINSERT INTO t VALUES (1);\n"
+               b"/*!50013  SQL SECURITY DEFINER */\nCREATE  PROCEDURE `p`()\n"
+               b"INSERT INTO t VALUES ('DEFINER=`x`@`y`');\n"), out
 
 assert split_name("MES DEV") == ("MES", "DEV")
 assert split_name("ISOURCING VAN PROD") == ("ISOURCING VAN", "PRODUCTION")
