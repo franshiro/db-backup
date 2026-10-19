@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
@@ -51,7 +51,7 @@ TOOLS = {
     "postgres": {"backup": ["pg_dump"], "restore": ["psql"]},
     "mysql": {"backup": ["mysqldump"], "restore": ["mysql"]},
 }
-FIELDS = ["name", "type", "host", "port", "user", "password", "database", "bulk", "version", "docker_image"]
+FIELDS = ["name", "group", "stage", "type", "host", "port", "user", "password", "database", "bulk", "version", "docker_image"]
 
 # ---------- output ----------
 
@@ -248,17 +248,83 @@ def pick(items, label, fmt=str):
             return items[int(s) - 1]
 
 
+def pick_db(label, dbs=None):
+    """Two steps: group, then a database in it (q goes back to groups). Flat list without a tty."""
+    dbs = load() if dbs is None else dbs
+    if not dbs:
+        die(f"no {label} available")
+    groups = list(dict.fromkeys(x["group"] for x in dbs))  # load() keeps entries grouped
+    if not interactive() or len(groups) == 1:
+        return pick(dbs, label, describe)
+    stages = lambda g: " · ".join(x["stage"] or x["name"] for x in dbs if x["group"] == g)
+    while True:
+        g = groups[select(label, groups, [stages(g) for g in groups], back="cancel")]
+        inner = [x for x in dbs if x["group"] == g]
+        try:
+            return inner[select(f"{label} › {g}", [describe(x) for x in inner])]
+        except KeyboardInterrupt:
+            print()
+
+
+def pick_backup(label):
+    """Three steps: group, database, file (newest first). q goes back to groups."""
+    rows = backup_rows()
+    if not rows:
+        die("no backup files available")
+    if not interactive():
+        return pick([r["path"] for r in rows], label,
+                    lambda p: f"{p.name:<46} {human(p.stat().st_size):>9}  {ago(p.stat().st_mtime)}")
+    group_of = {x["name"]: x["group"] for x in load()}
+    for r in rows:  # files of removed databases still get a group from their name
+        r["group"] = group_of.get(r["db"]) or split_name(r["db"])[0]
+    groups = sorted({r["group"] for r in rows}, key=str.lower)
+    count = lambda key, v: f"{sum(1 for r in rows if r[key] == v)} files"
+    while True:
+        g = groups[select(label, groups, [count("group", g) for g in groups], back="cancel")] if len(groups) > 1 else groups[0]
+        names = list(dict.fromkeys(r["db"] for r in rows if r["group"] == g))
+        try:
+            n = names[select(f"{label} › {g}", names, [count("db", n) for n in names])] if len(names) > 1 else names[0]
+            files = [r for r in rows if r["db"] == n]
+            return files[select(f"{label} › {n}", [file_label(r) for r in files])]["path"]
+        except KeyboardInterrupt:
+            if len(groups) == 1:
+                raise
+            print()
+
+
 # ---------- database list ----------
+
+STAGES = ["LOCAL", "DEV", "STAGING", "PRODUCTION"]
+STAGE_ALIAS = {"LOCAL": "LOCAL", "DEV": "DEV", "DEVELOPMENT": "DEV", "STAGING": "STAGING", "STG": "STAGING",
+               "PROD": "PRODUCTION", "PRODUCTION": "PRODUCTION"}
+
+
+def split_name(name):
+    """Guess (group, stage) from an alias like "MES DEV" or "v3 (local)"; stage is "" if none."""
+    m = re.match(r"^(.*?)[\s_-]*\(?([A-Za-z]+)\)?$", name.strip())
+    if m and m[1] and m[2].upper() in STAGE_ALIAS:
+        return m[1], STAGE_ALIAS[m[2].upper()]
+    return name, ""
+
+
+def group_key(db):
+    stage = db.get("stage", "")
+    return db["group"].lower(), STAGES.index(stage) if stage in STAGES else len(STAGES), db["name"].lower()
+
 
 def load():
     if not CONFIG.exists():
         return []
-    return json.loads(CONFIG.read_text())
+    dbs = json.loads(CONFIG.read_text())
+    for db in dbs:  # entries saved before groups existed
+        if "group" not in db:
+            db["group"], db["stage"] = split_name(db["name"])
+    return sorted(dbs, key=group_key)
 
 
 def save(dbs):
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(dbs, indent=2) + "\n")
+    CONFIG.write_text(json.dumps(sorted(dbs, key=group_key), indent=2) + "\n")
     os.chmod(CONFIG, 0o600)  # contains passwords
 
 
@@ -270,6 +336,9 @@ def validate(db):
         die(f"entry {db['name']!r}: type must be postgres or mysql")
     db.setdefault("port", DEFAULTS[db["type"]]["port"])
     db.setdefault("password", "")
+    if not db.get("group"):
+        db["group"], db["stage"] = split_name(db["name"])
+    db.setdefault("stage", "")
     return db
 
 
@@ -530,12 +599,16 @@ def cmd_list(a):
         print(c(DIM, f"no databases yet — add one with `dbb add`  (config: {CONFIG})"))
         return
     w = max([18] + [len(db["name"]) for db in dbs])
-    print(c(DIM, f"   {'NAME':<{w}} {'SERVER':<20} {'DATABASE':<16} CONNECTION"))
+    print(c(DIM, f"     {'NAME':<{w}} {'SERVER':<20} {'DATABASE':<16} CONNECTION"))
     mark = lambda db: c(GREEN, "◉") if db.get("bulk") else c(DIM, "○")
+    group = None
     for db in dbs:
+        if db["group"] != group:
+            group = db["group"]
+            print(f"\n {c(ACCENT + ';1', '▸ ' + group)}")
         t, tc = db["type"], TYPE_COLOR[db["type"]]
         conn = f"{db['user']}@{db['host']}:{db['port']}"
-        print(f" {mark(db)} {c(BOLD, db['name'].ljust(w))} {c(tc, pretty(t, db.get('version')).ljust(20))} "
+        print(f"   {mark(db)} {c(BOLD, db['name'].ljust(w))} {c(tc, pretty(t, db.get('version')).ljust(20))} "
               f"{db['database']:<16} {c(DIM, conn)}")
     print(c(DIM, f"\n {c(GREEN, '◉')} included in bulk backup ({sum(1 for x in dbs if x.get('bulk'))}/{len(dbs)})"
                  "  · change with `dbb mark`"))
@@ -566,15 +639,40 @@ def save_new(db):
     ok(f"saved {c(BOLD, db['name'])}")
 
 
+def choose_group(default=""):
+    """Pick a group (e.g. MES) and stage (LOCAL/DEV/STAGING/PRODUCTION). Returns (group, stage, name)."""
+    dbs = load()
+    groups = sorted({x["group"] for x in dbs}, key=str.lower)
+    if interactive() and groups:
+        new = "+ new group" + (f" ({default})" if default and default not in groups else "")
+        i = select("Group", groups + [new], [f"{sum(1 for x in dbs if x['group'] == g)} databases" for g in groups] + [""])
+        group = groups[i] if i < len(groups) else ""
+    else:
+        group = ""
+    while not group:
+        group = ask("new group name (e.g. MES)", default).strip()
+    taken = {x["stage"]: x["name"] for x in dbs if x["group"] == group}
+    if interactive():
+        stage = STAGES[select(f"Stage for {group}", STAGES, [f"exists: {taken[x]}" if x in taken else "" for x in STAGES])]
+    else:
+        stage = ""
+        while stage not in STAGES:
+            stage = ask(f"stage ({'/'.join(STAGES)})").upper()
+    return group, stage, taken.get(stage) or f"{group} {stage}"
+
+
 def cmd_add(a):
     if getattr(a, "env", None):
         return add_from_env(a.env)
+    group, stage, name = choose_group()
     t = list(DEFAULTS)[select("Database type", list(DEFAULTS))] if interactive() else ""
     while t not in DEFAULTS:
         t = ask("type (postgres/mysql)").lower()
     d = DEFAULTS[t]
     save_new({
-        "name": ask("name (alias)"),
+        "name": name,
+        "group": group,
+        "stage": stage,
         "type": t,
         "host": ask("host", "localhost"),
         "port": int(ask("port", str(d["port"]))),
@@ -702,8 +800,9 @@ def add_from_env(path):
             f["user"] = f["user"] or DEFAULTS[f["type"]]["user"]
         if interactive():
             print(c(DIM, f"  from {f['src']}: {f['type']} {f['user']}@{f['host']}:{f['port']}/{f['database']}"))
-            f["name"] = ask("name (alias)", f["name"])
-        save_new({k: f[k] for k in ("name", "type", "host", "port", "user", "password", "database")})
+            f["group"], f["stage"], f["name"] = choose_group(path.resolve().parent.name)
+        save_new({k: f[k] for k in ("name", "group", "stage", "type", "host", "port", "user", "password", "database")
+                  if k in f})
 
 
 def cmd_check(a):
@@ -729,7 +828,7 @@ def cmd_check(a):
 
 def cmd_remove(a):
     dbs = load()
-    name = a.name or pick(dbs, "Remove which database?", describe)["name"]
+    name = a.name or pick_db("Remove which database?", dbs)["name"]
     left = [x for x in dbs if x["name"] != name]
     if len(left) == len(dbs):
         die(f"{name!r} not found")
@@ -795,7 +894,7 @@ def cmd_backup(a):
     else:
         names = a.names
     if not names:
-        names = [pick(load(), "Backup which database?", describe)["name"]]
+        names = [pick_db("Backup which database?")["name"]]
     if a.output and len(names) > 1:
         die("-o only works with a single database")
     if len(names) == 1:
@@ -829,15 +928,14 @@ def cmd_restore(a):
     if a.file:
         path = Path(a.file).expanduser()
     else:
-        path = pick(backups(), "Restore which backup?",
-                    lambda p: f"{p.name:<46} {human(p.stat().st_size):>9}  {ago(p.stat().st_mtime)}")
+        path = pick_backup("Restore which backup?")
     if not path.exists():
         die(f"{path} not found")
     kind = file_type(path)
     check_gzip(path)
 
-    db = get_db(a.to) if a.to else pick([x for x in load() if x["type"] == kind],
-                                        f"Restore into which {kind} database?", describe)
+    db = get_db(a.to) if a.to else pick_db(f"Restore into which {kind} database?",
+                                           [x for x in load() if x["type"] == kind])
     if db["type"] != kind:
         die(f"{path.name} is a {kind} backup but {db['name']} is {db['type']}")
 

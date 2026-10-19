@@ -19,7 +19,7 @@ Installs to `~/.local/bin/dbb`. Requires only `python3` (3.8+), plus Docker if t
 
 ```bash
 dbb                       # interactive menu
-dbb add                   # add a connection (tests it and detects the server version)
+dbb add                   # add a connection: pick a group (e.g. MES) + stage LOCAL/DEV/STAGING/PRODUCTION
 dbb add --env [FILE|DIR]  # add connections found in a .env file; lines starting with # are ignored
 dbb list | check | remove
 dbb backup [NAME...] [--all | --bulk]
