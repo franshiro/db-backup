@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
@@ -964,8 +964,14 @@ def cmd_restore(a):
     if not a.yes and ask(f"type {c(RED, db['database'])} to continue") != db["database"]:
         die("aborted")
     if not skip_safety:
-        out, el = backup(db, new_backup_path(db, "_prerestore"), a.docker)
-        ok(f"safety backup {c(DIM, out.name)} ({human(out.stat().st_size)}, {el})")
+        try:
+            out, el = backup(db, new_backup_path(db, "_prerestore"), a.docker)
+            ok(f"safety backup {c(DIM, out.name)} ({human(out.stat().st_size)}, {el})")
+        except SystemExit:
+            # e.g. a broken view in the target makes mysqldump stop (error 1356)
+            if not interactive() or ask(f"safety backup failed; restore {c(RED, db['database'])} "
+                                        "WITHOUT a backup of the current data? [y/N]").lower() != "y":
+                die("aborted, target unchanged (or pass --no-safety-backup)")
     el = restore(db, path, a.docker)
     box("✓ Restore complete", [("source", path.name), ("target", f"{db['name']} ({db['database']})"),
                                ("time", el)])
