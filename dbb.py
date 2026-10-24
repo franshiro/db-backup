@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
@@ -656,7 +656,7 @@ def save_new(db, old=None):
             return
         dbs = [x for x in dbs if x["name"] != db["name"]]
     save(dbs + [db])
-    ok(f"saved {c(BOLD, db['name'])}")
+    ok(f"saved {c(BOLD, db['name'])}" + (c(DIM, "  · ◉ included in bulk backup") if db.get("bulk") else ""))
 
 
 def cmd_edit(a):
@@ -730,6 +730,7 @@ def cmd_add(a):
         "name": name,
         "group": group,
         "stage": stage,
+        "bulk": stage == "PRODUCTION",  # production is in bulk backup by default
         "type": t,
         "host": ask("host", "localhost"),
         "port": int(ask("port", str(d["port"]))),
@@ -858,8 +859,8 @@ def add_from_env(path):
         if interactive():
             print(c(DIM, f"  from {f['src']}: {f['type']} {f['user']}@{f['host']}:{f['port']}/{f['database']}"))
             f["group"], f["stage"], f["name"] = choose_group(path.resolve().parent.name)
-        save_new({k: f[k] for k in ("name", "group", "stage", "type", "host", "port", "user", "password", "database")
-                  if k in f})
+        save_new({**{k: f[k] for k in ("name", "group", "stage", "type", "host", "port", "user", "password", "database")
+                      if k in f}, "bulk": f.get("stage") == "PRODUCTION"})
 
 
 def cmd_check(a):
@@ -937,6 +938,21 @@ def cmd_mark(a):
     ok(f"bulk backup: {len(on)}/{len(dbs)} databases" + (f" — {', '.join(on)}" if on else ""))
 
 
+def filter_type(names, t=None):
+    """Keep only databases of type t; with no t and a tty, ask when the list mixes postgres and mysql."""
+    types = {x["name"]: x["type"] for x in load()}
+    have = [k for k in DEFAULTS if any(types.get(n) == k for n in names)]
+    if not t and len(have) > 1:
+        count = lambda k: sum(1 for n in names if types.get(n) == k)
+        opts = [None] + have
+        t = opts[select("Which database type?", ["All types"] + [pretty(k, "x").split()[0] for k in have],
+                        [f"{len(names)} databases"] + [f"{count(k)} databases" for k in have], back="cancel")]
+    picked = [n for n in names if not t or types.get(n) == t]
+    if not picked:
+        die(f"no {t} databases in this selection")
+    return picked
+
+
 def cmd_backup(a):
     if a.all:
         names = [x["name"] for x in load()]
@@ -950,6 +966,8 @@ def cmd_backup(a):
             die("no databases marked for bulk backup — run `dbb mark`")
     else:
         names = a.names
+    if (a.all or a.bulk) and (a.type or interactive()):
+        names = filter_type(names, a.type)
     if not names:
         names = [pick_db("Backup which database?")["name"]]
     if a.output and len(names) > 1:
@@ -1316,9 +1334,9 @@ def header():
 def menu():
     ns = argparse.Namespace
     items = [
-        ("↑  Backup", "dump one database", lambda: cmd_backup(ns(names=[], all=False, bulk=False, output=None, docker=False))),
+        ("↑  Backup", "dump one database", lambda: cmd_backup(ns(names=[], all=False, bulk=False, output=None, docker=False, type=None))),
         ("⇈  Bulk backup", "dump every database marked ◉", lambda: cmd_backup(
-            ns(names=[], all=False, bulk=True, output=None, docker=False))),
+            ns(names=[], all=False, bulk=True, output=None, docker=False, type=None))),
         ("◉  Bulk set", "choose which databases bulk backup includes", lambda: cmd_mark(ns(names=[], off=False))),
         ("↓  Restore", "drop target & load a backup", lambda: cmd_restore(
             ns(file=None, to=None, yes=False, dry_run=False, no_safety_backup=False, docker=False))),
@@ -1411,6 +1429,7 @@ def main():
     s.add_argument("names", nargs="*", help="saved database names (empty = choose)")
     s.add_argument("--all", action="store_true", help="backup every saved database")
     s.add_argument("--bulk", action="store_true", help="backup databases marked for bulk backup (see: dbb mark)")
+    s.add_argument("--type", choices=list(DEFAULTS), help="with --all/--bulk: only postgres or only mysql")
     s.add_argument("-o", "--output", help="output file (default: ~/.dbb/backups/<name>_<time>.<ext>)")
     s.add_argument("--docker", action="store_true", help="force docker even if local tools exist")
     s.set_defaults(fn=cmd_backup)

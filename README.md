@@ -23,7 +23,7 @@ dbb add                   # add a connection: pick a group (e.g. MES) + stage LO
 dbb add --env [FILE|DIR]  # add connections found in a .env file; lines starting with # are ignored
 dbb edit [NAME]           # change a saved connection (host, port, password, group, stage, ...)
 dbb list | check | remove
-dbb backup [NAME...] [--all | --bulk]
+dbb backup [NAME...] [--all | --bulk] [--type postgres|mysql]
 dbb mark [NAME...] [--off]  # choose databases for `backup --bulk` (no names = checklist)
 dbb restore [FILE] [--to NAME] [--dry-run]
 dbb export FILE | import FILE [--replace]
