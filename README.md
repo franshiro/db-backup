@@ -21,6 +21,7 @@ Installs to `~/.local/bin/dbb`. Requires only `python3` (3.8+), plus Docker if t
 dbb                       # interactive menu
 dbb add                   # add a connection: pick a group (e.g. MES) + stage LOCAL/DEV/STAGING/PRODUCTION
 dbb add --env [FILE|DIR]  # add connections found in a .env file; lines starting with # are ignored
+dbb edit [NAME]           # change a saved connection (host, port, password, group, stage, ...)
 dbb list | check | remove
 dbb backup [NAME...] [--all | --bulk]
 dbb mark [NAME...] [--off]  # choose databases for `backup --bulk` (no names = checklist)

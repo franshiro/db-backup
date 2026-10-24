@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.7.2"
+__version__ = "1.8.0"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
@@ -604,7 +604,21 @@ def cmd_list(a):
         print(c(DIM, f"no databases yet — add one with `dbb add`  (config: {CONFIG})"))
         return
     w = max([18] + [len(db["name"]) for db in dbs])
-    print(c(DIM, f"     {'NAME':<{w}} {'SERVER':<20} {'DATABASE':<16} CONNECTION"))
+    dw = max([8] + [len(db["database"]) for db in dbs])
+    last = {}  # db name -> mtime of its newest regular backup (safety backups don't count)
+    for r in backup_rows():
+        if not r["pre"]:
+            last.setdefault(r["db"], r["mtime"])
+
+    def when(db):
+        ts = last.get(db["name"])
+        if ts is None:
+            return c(DIM, "never".ljust(16))
+        age = time.time() - ts
+        return c(GREEN if age < 86400 else YELLOW if age < 7 * 86400 else RED,
+                 datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M"))
+
+    print(c(DIM, f"     {'NAME':<{w}} {'SERVER':<20} {'DATABASE':<{dw}} {'LAST BACKUP':<16} CONNECTION"))
     mark = lambda db: c(GREEN, "◉") if db.get("bulk") else c(DIM, "○")
     group = None
     for db in dbs:
@@ -614,13 +628,14 @@ def cmd_list(a):
         t, tc = db["type"], TYPE_COLOR[db["type"]]
         conn = f"{db['user']}@{db['host']}:{db['port']}"
         print(f"   {mark(db)} {c(BOLD, db['name'].ljust(w))} {c(tc, pretty(t, db.get('version')).ljust(20))} "
-              f"{db['database']:<16} {c(DIM, conn)}")
+              f"{db['database']:<{dw}} {when(db)} {c(DIM, conn)}")
     print(c(DIM, f"\n {c(GREEN, '◉')} included in bulk backup ({sum(1 for x in dbs if x.get('bulk'))}/{len(dbs)})"
                  "  · change with `dbb mark`"))
+    print(c(DIM, f" last backup: {c(GREEN, '< 1 day')}  {c(YELLOW, '< 7 days')}  {c(RED, 'older')}"))
 
 
-def save_new(db):
-    """Test the connection, then save the entry (asks before overwriting)."""
+def save_new(db, old=None):
+    """Test the connection, then save the entry (asks before overwriting). old: name of the entry being edited."""
     validate(db)
     with Spinner(f"connecting to {db['host']}:{db['port']}"):
         ver, exists, err = probe(db)
@@ -634,7 +649,7 @@ def save_new(db):
         box(f"✓ Connected · {db['name']}", [
             ("server", pretty(db["type"], ver)),
             ("database", db["database"] + ("" if exists else "  (not found, created on restore)"))])
-    dbs = load()
+    dbs = [x for x in load() if x["name"] != old]
     if any(x["name"] == db["name"] for x in dbs):
         if not interactive() or ask(f"{db['name']!r} exists, overwrite? [y/N]").lower() != "y":
             print(c(DIM, f"  {db['name']} already exists, skipped"))
@@ -642,6 +657,43 @@ def save_new(db):
         dbs = [x for x in dbs if x["name"] != db["name"]]
     save(dbs + [db])
     ok(f"saved {c(BOLD, db['name'])}")
+
+
+def cmd_edit(a):
+    if not interactive():
+        die("edit is interactive; or edit the JSON directly: " + str(CONFIG))
+    old = get_db(a.name) if a.name else pick_db("Edit which database?")
+    db = dict(old)
+    fields = ["group", "stage", "type", "host", "port", "user", "password", "database"]
+    while True:
+        print()
+        show = lambda f: ("•" * 8 if db[f] else c(DIM, "(empty)")) if f == "password" else str(db.get(f) or "")
+        labels = [f"{f:<9} {show(f)}" for f in fields] + ["✓ save", "× cancel"]
+        try:
+            i = select(f"Edit {old['name']}", labels, back="cancel")
+        except KeyboardInterrupt:
+            return info("cancelled, nothing changed")
+        if i == len(fields):
+            break
+        if i > len(fields):
+            return info("cancelled, nothing changed")
+        f = fields[i]
+        if f == "stage":
+            db[f] = STAGES[select("Stage", STAGES)]
+        elif f == "type":
+            db[f] = list(DEFAULTS)[select("Database type", list(DEFAULTS))]
+            db.pop("version", None)
+        elif f == "password":
+            db[f] = getpass.getpass(c(ACCENT, "? ") + c(BOLD, "password") + c(DIM, " (enter = keep) ")) or db[f]
+        elif f == "port":
+            v = ask("port", str(db[f]))
+            db[f] = int(v) if v.isdigit() else db[f]
+        else:
+            db[f] = ask(f, str(db[f])).strip() or db[f]
+    if (db["group"], db["stage"]) != (old["group"], old["stage"]):
+        db["name"] = f"{db['group']} {db['stage']}".strip()
+        info(f"renamed {old['name']} → {db['name']} (existing backup files keep the old name)")
+    save_new(db, old=old["name"])
 
 
 def choose_group(default=""):
@@ -1274,6 +1326,7 @@ def menu():
         ("≡  Databases", "show saved connections", lambda: cmd_list(None)),
         ("✓  Check", "test connections & detect server versions", lambda: cmd_check(ns(names=[], docker=False))),
         ("+  Add", "save a new connection", lambda: cmd_add(ns(env=None))),
+        ("✎  Edit", "change host, port, password, group, ...", lambda: cmd_edit(ns(name=None))),
         ("⇣  Add from .env", "read connection from a .env file", lambda: cmd_add(ns(env=ask(".env file", ".env")))),
         ("−  Remove", "delete a saved connection", lambda: cmd_remove(ns(name=None))),
         ("⇥  Export", "write database list to JSON", lambda: cmd_export(
@@ -1341,6 +1394,9 @@ def main():
     s.add_argument("names", nargs="*", help="saved database names (empty = all)")
     s.add_argument("--docker", action="store_true", help="force docker even if local tools exist")
     s.set_defaults(fn=cmd_check)
+    s = sub.add_parser("edit", help="edit a saved database (host, password, group, ...)")
+    s.add_argument("name", nargs="?"); s.set_defaults(fn=cmd_edit)
+
     s = sub.add_parser("remove", help="remove saved database")
     s.add_argument("name", nargs="?"); s.set_defaults(fn=cmd_remove)
 
