@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
@@ -464,15 +464,17 @@ def copy(src, dst, sp):
 
 
 DEFINER_RE = re.compile(rb"DEFINER=`(?:[^`]|``)*`@`(?:[^`]|``)*`")
+UCA1400_RE = re.compile(rb"\b(utf8mb3|utf8mb4|utf8|ucs2|utf16|utf16le|utf32)_uca1400(?:_[a-z]+)*\b")
 
 
 class MysqlFilter:
     """Read wrapper that makes a mysqldump file load on another server:
     - drops SET @@GLOBAL.GTID_PURGED, which fails on a target with its own GTID history (ERROR 3546)
     - drops DEFINER=`user`@`host` from views, routines, triggers and events, so they belong to the
-      restoring user instead of an account that may not exist there (ERROR 1449)"""
-    def __init__(self, f):
-        self.f, self.skip = f, False
+      restoring user instead of an account that may not exist there (ERROR 1449)
+    - to_mysql: maps MariaDB 10.10+ *_uca1400_* collations to *_unicode_ci, which MySQL knows (ERROR 1273)"""
+    def __init__(self, f, to_mysql=False):
+        self.f, self.skip, self.to_mysql = f, False, to_mysql
 
     def read(self, n=-1):
         while True:
@@ -482,7 +484,10 @@ class MysqlFilter:
             if line.startswith(b"SET @@GLOBAL.GTID_PURGED"):
                 self.skip = True
             if not self.skip:
-                return line if line.startswith(b"INSERT INTO") else DEFINER_RE.sub(b"", line)  # never touch row data
+                if line.startswith(b"INSERT INTO"):  # never touch row data
+                    return line
+                line = DEFINER_RE.sub(b"", line)
+                return UCA1400_RE.sub(rb"\1_unicode_ci", line) if self.to_mysql else line
             if line.rstrip().endswith(b";"):  # the GTID set can span several lines
                 self.skip = False
 
@@ -589,7 +594,7 @@ def restore(db, path, force_docker):
             run(wrap(["mysql", *conn, "-e",
                       f"DROP DATABASE IF EXISTS {ident}; CREATE DATABASE {ident};"]), env)
             with gzip.open(path, "rb") as f:
-                rc = stream(wrap(["mysql", *conn, name]), env, sp, src=MysqlFilter(f))
+                rc = stream(wrap(["mysql", *conn, name]), env, sp, src=MysqlFilter(f, to_mysql="mariadb" not in (db.get("version") or "").lower()))
 
     if rc != 0:
         die(f"restore finished with errors (exit {rc}); check output above")

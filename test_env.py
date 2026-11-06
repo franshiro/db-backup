@@ -73,4 +73,13 @@ assert split_name("app-staging") == ("app", "STAGING")
 assert split_name("v3") == ("v3", "")
 assert split_name("Development") == ("Development", "")
 
+ddl = (b"CREATE TABLE `t` (`a` varchar(9) COLLATE utf8mb3_uca1400_ai_ci) DEFAULT CHARSET=utf8mb4 "
+       b"COLLATE=utf8mb4_uca1400_as_cs;\n"
+       b"INSERT INTO t VALUES ('utf8mb4_uca1400_ai_ci');\n")
+want = (b"CREATE TABLE `t` (`a` varchar(9) COLLATE utf8mb3_unicode_ci) DEFAULT CHARSET=utf8mb4 "
+        b"COLLATE=utf8mb4_unicode_ci;\n"
+        b"INSERT INTO t VALUES ('utf8mb4_uca1400_ai_ci');\n")
+assert b"".join(iter(MysqlFilter(io.BytesIO(ddl), to_mysql=True).read, b"")) == want
+assert b"".join(iter(MysqlFilter(io.BytesIO(ddl)).read, b"")) == ddl, "MariaDB target keeps uca1400"
+
 print("ok")
