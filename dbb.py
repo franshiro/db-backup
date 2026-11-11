@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 
 # Raw URL of the repo holding dbb.py, used by `dbb update`.
 REPO_RAW = os.environ.get("DBB_REPO_RAW", "https://raw.githubusercontent.com/franshiro/db-backup/main")
@@ -386,7 +386,10 @@ def client(db, step, force_docker, image=None):
 
 def probe(db, force_docker=False, image=None):
     """Connect to the server. Returns (version, database_exists, error)."""
-    wrap, env, host, _ = client(db, "restore", force_docker, image)
+    try:
+        wrap, env, host, _ = client(db, "restore", force_docker, image)
+    except SystemExit as e:  # no client tools / docker: report it, let callers decide (add still saves)
+        return None, False, re.sub(r"\x1b\[[0-9;]*m", "", str(e.code)).replace("✗ ", "")
     name = db["database"]
     if db["type"] == "postgres":
         lit = "'" + name.replace("'", "''") + "'"
@@ -642,14 +645,21 @@ def cmd_list(a):
 def save_new(db, old=None):
     """Test the connection, then save the entry (asks before overwriting). old: name of the entry being edited."""
     validate(db)
-    with Spinner(f"connecting to {db['host']}:{db['port']}"):
-        ver, exists, err = probe(db)
+    try:
+        client(db, "restore", False)
+        with Spinner(f"connecting to {db['host']}:{db['port']}"):
+            ver, exists, err = probe(db)
+    except SystemExit as e:  # no client tools and no docker: save untested, it can be checked later
+        print(c(YELLOW, "! ") + re.sub(r"\x1b\[[0-9;]*m", "", str(e.code)).replace("✗ ", "")
+              + c(DIM, " — saved without a connection test (run `dbb check` later)"))
+        ver = err = None
+        exists = True
     if err:
         print(c(RED, "✗ ") + f"cannot connect: {err}")
         if not interactive() or ask("save anyway? [y/N]").lower() != "y":
             print(c(DIM, f"  {db['name']} not saved"))
             return
-    else:
+    elif ver:
         db["version"] = ver
         box(f"✓ Connected · {db['name']}", [
             ("server", pretty(db["type"], ver)),
